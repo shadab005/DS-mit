@@ -1,5 +1,13 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +52,42 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	f, _ := os.Create(outFile)
+	for i:=0 ; i < nMap ; i++ {
+		m := make(map[string][]string)
+		file := reduceName(jobName, i , reduceTask)
+		fileReader, _ := os.Open(file)
+		dec := json.NewDecoder(fileReader)
+
+		//read this file line by line and decode the data to put into data structure map[key]list
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err == io.EOF {
+				break
+			} else if err != nil {
+				log.Fatal(err)
+			}
+			m[kv.Key] = append(m[kv.Key], kv.Value)
+		}
+		fileReader.Close()
+
+
+		//iterate over the keys of map in sorted way.
+		//call the reduce function(key string, values []string) string
+		//The string returned by reduce function needs to be encoded and written in the output file
+		var keys []string
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		enc := json.NewEncoder(f)
+		for _, k := range keys {
+			enc.Encode(KeyValue{k, reduceF(k, m[k])})
+		}
+	}
+	f.Close()
+
+
+
 }

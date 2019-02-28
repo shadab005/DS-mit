@@ -2,7 +2,7 @@ package mapreduce
 
 import (
 	"fmt"
-	"sync"
+	"sync/atomic"
 )
 
 //
@@ -33,6 +33,44 @@ func (manager *WorkerManager) initialize(registerChan chan string) {
 	manager.c = registerChan
 }
 
+type TaskManager struct {
+	tasks chan int
+	quit  chan int
+	val   int64
+	N     int64
+}
+
+func (t *TaskManager) initialize(ntasks int) {
+	t.tasks = make(chan int)
+	t.N = int64(ntasks)
+	t.quit = make(chan int)
+	go func() {
+		for i := 0; i < ntasks; i++ {
+			t.tasks <- i
+		}
+	}()
+}
+
+func (t *TaskManager) getTask() int {
+	return <-t.tasks
+}
+
+func (t *TaskManager) addToTaskList(task int) {
+	go func() {
+		t.tasks <- task
+	}()
+}
+
+func (t *TaskManager) completeOne() {
+	atomic.AddInt64(&t.val, 1)
+	if atomic.LoadInt64(&t.val) >= t.N {
+		t.quit <- 1
+	}
+}
+
+func (t *TaskManager) getCount() int {
+	return int(atomic.LoadInt64(&t.val))
+}
 
 func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, registerChan chan string) {
 	var ntasks int
@@ -54,7 +92,6 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 
-
 	// Code
 	// Continuously read from registerChan for register worker
 	// Assign worker map or reduce task on some other thread
@@ -66,23 +103,33 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	wkm := new(WorkerManager)
 	wkm.initialize(registerChan)
 
-	var wg sync.WaitGroup
-	wg.Add(ntasks)
-	for i := 0 ; i < ntasks ; i++ {
+	t := new(TaskManager)
+	t.initialize(ntasks)
 
+	done :=0
+	for done == 0{
 		//fetch idle worker
-		workerAddress := wkm.fetchIdleWorker()
+		select {
+		case v := <-t.tasks:
+			i := v
+			workerAddress := wkm.fetchIdleWorker()
+			go func(x int, wk string) {
+				mapTaskArg := DoTaskArgs{jobName, mapFiles[x], phase, x, n_other}
+				ok := call(wk, "Worker.DoTask", mapTaskArg, nil)
+				if ok {
+					wkm.freeWorker(wk)
+					t.completeOne()
+				} else {
+					t.addToTaskList(x)
+				}
+			}(i, workerAddress)
 
-		go func(x int) {
-			mapTaskArg := DoTaskArgs{jobName, mapFiles[x], phase, x, n_other}
-			call(workerAddress, "Worker.DoTask", mapTaskArg, nil)
-			//return this worker to the idle pool
-			wkm.freeWorker(workerAddress)
-			wg.Done()
-		}(i)
+		case v := <-t.quit:
+			fmt.Println("Quiting", v)
+			done = 1
+			break
+		}
 	}
-	wg.Wait()
-
 
 	fmt.Printf("Schedule: %v done\n", phase)
 }

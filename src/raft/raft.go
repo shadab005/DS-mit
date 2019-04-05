@@ -272,7 +272,16 @@ func (rf *Raft) RequestVote(request *RequestVoteArgs, reply *RequestVoteReply) {
 		LogInfo("[RequestVote] Server %s Requester %s | CandidateId is outdated", rf.id, request.CandidateId)
 		reply.VoteGranted = false
 		return
-	} else if rf.votedFor == NULL || rf.votedFor == request.CandidateId {
+	}
+
+	if request.Term > rf.currentTerm {
+		rf.currentTerm = request.Term
+		rf.votedFor = NULL
+		rf.state = FOLLOWER
+		LogInfo("[RequestVote] Server %s Requester %s | Updating Term = %d", rf.id, request.CandidateId, rf.currentTerm)
+	}
+
+	if rf.votedFor == NULL || rf.votedFor == request.CandidateId {
 		//checking if candidate's log entry is more up to date
 		lastLogIndex, lastLogTerm := rf.getLastEntryInfo()
 		LogInfo("[RequestVote] Server %s Requester %s | LastLogIndex = %d and lastLogTerm = %d", rf.id, request.CandidateId, lastLogIndex, lastLogTerm)
@@ -296,12 +305,6 @@ func (rf *Raft) RequestVote(request *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
-	if request.Term > rf.currentTerm {
-		rf.currentTerm = request.Term
-		rf.votedFor = NULL
-		rf.state = FOLLOWER
-		LogInfo("[RequestVote] Server %s Requester %s | Updating Term = %d", rf.id, request.CandidateId, rf.currentTerm)
-	}
 	LogInfo("[RequestVote] Server %s Requester %s | Exiting VoteGranted = %v", rf.id, request.CandidateId, reply.VoteGranted)
 }
 
@@ -554,6 +557,10 @@ func (rf *Raft) broadCastCommand(commandIndex int) {
 										rf.nextIndex[j]--
 										rf.broadCastMutex.Unlock()
 									}
+								} else {
+									rf.broadCastMutex.Lock()
+									termReplicated = true
+									rf.broadCastMutex.Unlock()
 								}
 							}
 
@@ -785,6 +792,7 @@ func (rf *Raft) startElectionAsCandidate() {
 		count = x
 	case <-time.After(time.Duration(ElectionMinTime+rand.Int63n(ElectionMaxTime-ElectionMinTime)) * time.Millisecond):
 		LogWarning("[==TIMEOUT==] [ID : %s Total Votes = %d Term = %d] Election couldn't select leader withing 0.5 seconds", rf.id, count, rf.GetCurrentTerm())
+		rf.SetLastHeartBeat(time.Now())
 	}
 
 	LogInfo("ID=%s And Vote Collected = %d ", rf.id, count)

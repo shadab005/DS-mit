@@ -453,7 +453,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	time.Sleep(10*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	isLeader := rf.state == LEADER
 	LogInfo("[**MESSAGE**] Command received from client %v for %s and isLeader = %v", command, rf.id, isLeader)
 	// Your code here (2B).
@@ -488,18 +488,10 @@ func (rf *Raft) handleClientMessages() {
 }
 
 func (rf *Raft) broadCastCommand(commandIndex int) {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
 	LogInfo("[----------Message broadcasting----------] by %s ", rf.id)
-	if commandIndex <= rf.GetCommittedIndex() {
-		LogInfo("[Broadcast] old command index")
-		return
-	}
 	replyChannel := make(chan bool)
-	//var mutex sync.Mutex
-	//done := false
-	done := new(AtomicBool)
-	done.Set(false)
+	shouldTerminate := new(AtomicBool)
+	shouldTerminate.Set(false)
 	sendLogMessage := func() {
 		for i := 0; i < rf.totalServers && rf.GetCurrentState() == LEADER; i++ {
 			if i != rf.me {
@@ -507,11 +499,17 @@ func (rf *Raft) broadCastCommand(commandIndex int) {
 					termReplicated := false
 					currentTerm := rf.GetCurrentTerm()
 
-					for !termReplicated && !done.Get() && rf.GetCurrentState() == LEADER && currentTerm == rf.GetCurrentTerm() {
+					for !termReplicated && !shouldTerminate.Get() && rf.GetCurrentState() == LEADER && currentTerm == rf.GetCurrentTerm() && rf.GetIsAlive() {
 
 						rf.broadCastMutex.Lock()
 						prevIndex := rf.nextIndex[j] - 1
 						rf.mu.Lock()
+						if prevIndex >= len(rf.log) {
+							termReplicated = true
+							rf.mu.Unlock()
+							rf.broadCastMutex.Unlock()
+							continue
+						}
 						prevTerm := rf.log[prevIndex].Term
 						nextIn := rf.nextIndex[j]
 						lastIndex, _ := rf.getLastEntryInfo()
@@ -577,18 +575,15 @@ func (rf *Raft) broadCastCommand(commandIndex int) {
 	case <-time.After(300 * time.Millisecond):
 		LogWarning("[==TIMEOUT==] AppendEntry timed out to get Append entry reply by Leader %s", rf.id)
 	}
-	//done = true
-	done.Set(true)
 
 	LogInfo("Total append entry reply that came = %d at server %s with state %s and term %d", count, rf.id, rf.GetCurrentState(), rf.GetCurrentTerm())
 	if count > rf.totalServers/2 && rf.GetCurrentState() == LEADER {
 		//Append entry successfully replicated to majority of servers.
 		//This can be now committed for server and then response can be returned accordingly
 		LogInfo("Server %s attempting commit", rf.id)
-		//rf.SetCommittedIndex(commandIndex)
-		//rf.commitMessage(commandIndex)
 		rf.attemptCommit()
 	} else {
+		shouldTerminate.Set(true)
 		LogInfo("[==Message committed FAILED==] by %s for index %d", rf.id, commandIndex)
 	}
 	LogInfo("[----------Message broadcasting Completed----------] by %s ", rf.id)
@@ -716,6 +711,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+const (
+	ElectionMinTime = 150
+	ElectionMaxTime = 300
+)
+
 func (rf *Raft) initElection() {
 
 	for rf.GetIsAlive() {
@@ -723,9 +723,8 @@ func (rf *Raft) initElection() {
 			time.Sleep(1 * time.Second)
 		}
 		//time.Sleep(150 * time.Millisecond)
-		time.Sleep(time.Duration(200+rand.Intn(200)) * time.Millisecond)
-		difference := time.Now().Sub(rf.GetLastHeartBeat())
-		if difference >= 500*time.Millisecond {
+		time.Sleep(time.Millisecond * time.Duration(ElectionMinTime+rand.Int63n(ElectionMaxTime-ElectionMinTime)))
+		if time.Now().Sub(rf.GetLastHeartBeat()) >= (500+time.Duration(rand.Intn(100)))*time.Millisecond {
 			//start en election. reset the timeout
 			LogInfo("[==TIMEOUT==] Election Timed out by %v. New Election by %s", time.Now().Sub(rf.GetLastHeartBeat()), rf.ToString())
 			rf.startElectionAsCandidate()
@@ -784,7 +783,7 @@ func (rf *Raft) startElectionAsCandidate() {
 	select {
 	case x := <-rf.countVotes(voteChannel):
 		count = x
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(time.Duration(ElectionMinTime+rand.Int63n(ElectionMaxTime-ElectionMinTime)) * time.Millisecond):
 		LogWarning("[==TIMEOUT==] [ID : %s Total Votes = %d Term = %d] Election couldn't select leader withing 0.5 seconds", rf.id, count, rf.GetCurrentTerm())
 	}
 

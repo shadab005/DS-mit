@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
+	"labgob"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -195,6 +197,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -202,6 +211,7 @@ func (rf *Raft) persist() {
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+	LogWarning("[readPersist] Data = nil for %s", rf.id)
 		return
 	}
 	// Your code here (2C).
@@ -217,6 +227,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor string
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		LogWarning("Error in decoding %v %v and %v", currentTerm, votedFor, log)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+		LogWarning("[readPersist] rf.id = %s rf.currentTerm = %d rf.votedFor = %s rf.log = %v", rf.id, rf.currentTerm, rf.votedFor, rf.log)
+	}
+
 }
 
 //
@@ -304,6 +328,7 @@ func (rf *Raft) RequestVote(request *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentTerm = request.Term
 		}
 	}
+	rf.persist()
 
 	LogInfo("[RequestVote] Server %s Requester %s | Exiting VoteGranted = %v", rf.id, request.CandidateId, reply.VoteGranted)
 }
@@ -365,6 +390,7 @@ type AppendEntryReply struct {
 func (rf *Raft) AppendEntry(request *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	LogInfo("[AppendEntry] \nServer : %s Commit Index = %d Log entry = %v \nRequester : LeaderID = %s term = %d PrevLogIndex = %d PrevLogTerm = %d Log = %v LeaderCommit = %d",
 		rf.stringify(), rf.commitIndex, rf.log, request.LeaderID, request.Term, request.PrevLogIndex, request.PrevLogTerm, request.LogEntries, request.LeaderCommit)
 
@@ -428,6 +454,7 @@ func (rf *Raft) AppendEntry(request *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	rf.votedFor = NULL
 	rf.lastHeartBeat = time.Now()
+	rf.persist()
 	LogInfo("[AppendEntry] Server %s Requester %s | Exiting by setting lastHeartBeat and resetting votedFor", rf.id, request.LeaderID)
 }
 
@@ -454,9 +481,9 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
+	time.Sleep(20 * time.Millisecond)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	time.Sleep(10 * time.Millisecond)
 	isLeader := rf.state == LEADER
 	LogInfo("[**MESSAGE**] Command received from client %v for %s and isLeader = %v", command, rf.id, isLeader)
 	// Your code here (2B).
@@ -507,6 +534,7 @@ func (rf *Raft) broadCastCommand(commandIndex int) {
 						rf.broadCastMutex.Lock()
 						prevIndex := rf.nextIndex[j] - 1
 						rf.mu.Lock()
+						committedIndex := rf.commitIndex
 						if prevIndex >= len(rf.log) {
 							termReplicated = true
 							rf.mu.Unlock()
@@ -523,10 +551,10 @@ func (rf *Raft) broadCastCommand(commandIndex int) {
 							entries := rf.log[nextIn:]
 							appendEntryArgs :=
 								&AppendEntryArgs{
-									Term:         rf.GetCurrentTerm(),
+									Term:         currentTerm,
 									LeaderID:     rf.id,
 									LogEntries:   entries,
-									LeaderCommit: rf.GetCommittedIndex(),
+									LeaderCommit: committedIndex,
 									PrevLogIndex: prevIndex,
 									PrevLogTerm:  prevTerm}
 
@@ -548,9 +576,12 @@ func (rf *Raft) broadCastCommand(commandIndex int) {
 									//Case when reply fails. Reply could fail due to less term number or due to log inconsistency
 									if appendEntryReply.Term > rf.GetCurrentTerm() {
 										// promote to follower rf.promoteToFollower()
-										rf.SetCurrentState(FOLLOWER)
-										rf.SetVotedFor(NULL)
-										rf.SetCurrentTerm(appendEntryReply.Term)
+										rf.mu.Lock()
+										rf.state = FOLLOWER
+										rf.votedFor = NULL
+										rf.currentTerm = appendEntryReply.Term
+										rf.persist()
+										rf.mu.Unlock()
 										replyChannel <- false
 									} else {
 										rf.broadCastMutex.Lock()
@@ -593,6 +624,7 @@ func (rf *Raft) broadCastCommand(commandIndex int) {
 		shouldTerminate.Set(true)
 		LogInfo("[==Message committed FAILED==] by %s for index %d", rf.id, commandIndex)
 	}
+	rf.persist()
 	LogInfo("[----------Message broadcasting Completed----------] by %s ", rf.id)
 }
 
@@ -710,10 +742,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.isAlive = true
 	rf.atomicBool = new(AtomicBool)
 
-	go rf.initElection()
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	go rf.initElection()
+
 
 	return rf
 }
@@ -746,13 +779,15 @@ func (rf *Raft) startElectionAsCandidate() {
 	//increment current Term
 	rf.mu.Lock()
 	rf.currentTerm++
-	rf.mu.Unlock()
 	//Transition to candidate
-	rf.SetCurrentState(CANDIDATE)
+	rf.state = CANDIDATE
 	//Vote for itself
-	rf.SetVotedFor(rf.id)
+	rf.votedFor = rf.id
 	//reseting election timeout
-	rf.SetLastHeartBeat(time.Now())
+	rf.lastHeartBeat = time.Now()
+	lastLogIndex, lastLogTerm := rf.getLastEntryInfo()
+	requestVoteArgs := &RequestVoteArgs{rf.currentTerm, rf.id, lastLogIndex, lastLogTerm}
+	rf.mu.Unlock()
 
 	voteChannel := make(chan bool)
 	//invoke RequestVote rpcs in parallel to each server to get vote
@@ -761,8 +796,6 @@ func (rf *Raft) startElectionAsCandidate() {
 			//Construct requestArg and invoke the api
 			go func(j int) {
 				//Get vote by calling the rpc
-				lastLogIndex, lastLogTerm := rf.getLastEntryInfo()
-				requestVoteArgs := &RequestVoteArgs{rf.GetCurrentTerm(), rf.id, lastLogIndex, lastLogTerm}
 				var requestVoteReply RequestVoteReply
 				ok := rf.sendRequestVote(j, requestVoteArgs, &requestVoteReply)
 				rf.mu.Lock()
@@ -773,12 +806,12 @@ func (rf *Raft) startElectionAsCandidate() {
 					rf.state = FOLLOWER
 					rf.currentTerm = requestVoteReply.Term
 					rf.votedFor = NULL
+					rf.persist()
 				}
 				rf.mu.Unlock()
 				if ok {
 					voteChannel <- requestVoteReply.VoteGranted && rf.GetCurrentTerm() == requestVoteArgs.Term
 				} else {
-					//fmt.Println("Request Vote RPC Failed")
 					LogWarning("Request Vote Failed. Requester id = %s and requesting to = %d for Term = %d", rf.id, j, rf.GetCurrentTerm())
 					voteChannel <- false
 				}
@@ -806,6 +839,10 @@ func (rf *Raft) startElectionAsCandidate() {
 		LogInfo("Server with id %s din't receive enough votes (Count = %d) for Term %d", rf.id, count, rf.GetCurrentTerm())
 		rf.promoteToFollower()
 	}
+
+	rf.mu.Lock()
+	rf.persist()
+	rf.mu.Unlock()
 
 }
 
@@ -894,6 +931,9 @@ func (rf *Raft) sendHeartBeats() {
 						LogInfo("Demoting the Leader %s to Follower", rf.id)
 						rf.promoteToFollower()
 						rf.SetCurrentTerm(appendEntryReply.Term)
+						rf.mu.Lock()
+						rf.persist()
+						rf.mu.Unlock()
 					}
 					if rf.GetCurrentState() == FOLLOWER {
 						return
